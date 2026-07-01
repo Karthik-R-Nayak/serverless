@@ -1,0 +1,140 @@
+"""
+PIPELINE ORCHESTRATOR
+
+Wires the three independent modules together:
+
+    triage_classifier.py  --(retained pages)-->  chunk_streamer.py
+                                                        |
+                                                        v
+                                          secure_transfer.py (S3 uploader)
+
+Each module only knows about the layer immediately below it through a
+clean interface (TriageStreamingExtractor.extract() generator,
+ChunkStreamer.add_page()/stream(), SecureTransferModule.upload_chunk()).
+"""
+
+import json
+import time
+from pathlib import Path
+from typing import Dict, Optional
+
+from triage_classifier import TriageStreamingExtractor, PAGE_SIZE, ENTROPY_THRESHOLD
+from chunk_streamer import ChunkStreamer, CHUNK_SIZE
+from secure_transfer import SecureTransferModule, MultipartUploadError
+
+
+def run_complete_pipeline(
+    dump_file: str,
+    case_id: str,
+    s3_client=None,
+    bucket: str = 'forensic-evidence',
+    use_moto: bool = True,
+    chunk_size: int = CHUNK_SIZE,
+) -> Dict:
+    """
+    Run the complete pipeline:
+        1. Triage the dump file page-by-page.
+        2. Buffer retained pages into chunks (and build the page Merkle tree).
+        3. Upload chunks to S3 with retry/abort handling.
+        4. Store manifest + forensic metadata.
+    """
+    print("\n" + "=" * 80)
+    print("FORENSIC EVIDENCE PIPELINE")
+    print("=" * 80)
+
+    if s3_client is None:
+        if not use_moto:
+            raise ValueError("Must provide s3_client or set use_moto=True")
+        from moto import mock_aws
+        mock = mock_aws()
+        mock.start()
+        import boto3
+        s3_client = boto3.client('s3', region_name='us-east-1')
+        s3_client.create_bucket(Bucket=bucket)
+        print("\n[INIT] Using moto for local S3 testing")
+
+    print(f"\n[INIT] Loading dump file: {dump_file}")
+    extractor = TriageStreamingExtractor(dump_file, threshold=ENTROPY_THRESHOLD)
+
+    print(f"[INIT] Initializing chunk streamer (chunk size: {chunk_size / (1024**2):.0f} MB)")
+    streamer = ChunkStreamer(case_id=case_id, chunk_size=chunk_size)
+
+    key = f'{case_id}/evidence.bin'
+    transfer = SecureTransferModule(s3_client=s3_client, bucket=bucket, key=key, case_id=case_id)
+    transfer.start()
+
+    print(f"\n[STREAM] Streaming triaged evidence to s3://{bucket}/{key}")
+    failure: Optional[str] = None
+    try:
+        for chunk in streamer.stream(extractor.extract()):
+            chunk_mb = len(chunk.data) / (1024 ** 2)
+            print(
+                f"[STREAM] Chunk {chunk.chunk_id:3d}: {chunk_mb:6.1f} MB | "
+                f"Hash: {chunk.sha256[:16]}... | Pages: {chunk.num_pages}"
+            )
+            transfer.upload_chunk(chunk)
+    except MultipartUploadError as exc:
+        failure = str(exc)
+        print(f"\n[STREAM] Upload failed: {failure}")
+
+    results: Dict = {
+        'case_id': case_id,
+        'triage_stats': extractor.stats(),
+        'manifest': [entry.__dict__ for entry in streamer.get_manifest()],
+        'chunk_hashes': streamer.chunk_hashes,
+        **streamer.get_metadata(page_size=PAGE_SIZE),
+    }
+
+    if failure:
+        results['status'] = 'failed'
+        results['error'] = failure
+    else:
+        transfer_stats = transfer.complete()
+        results['status'] = 'completed'
+        results.update(transfer_stats)
+        _print_results(results, transfer_stats)
+
+    manifest_file = f"{case_id}_manifest.json"
+    with open(manifest_file, "w") as f:
+        json.dump(results, f, indent=2, default=str)
+    print(f"\n[SAVE] Manifest saved to: {manifest_file}")
+
+    return results
+
+
+def _print_results(results: Dict, transfer_stats: Dict) -> None:
+    print("\n" + "=" * 80)
+    print("STREAMING UPLOAD COMPLETE")
+    print("=" * 80)
+
+    print(f"\nCase ID: {results['case_id']}")
+
+    triage = results['triage_stats']
+    print(f"\nTriage Statistics:")
+    print(f"  Total pages:  {triage['total_pages']:,}")
+    print(f"  Kept:         {triage['kept_pages']:,}")
+    print(f"  Dropped:      {triage['dropped_pages']:,}")
+    print(f"  Drop rate:    {triage['drop_rate_pct']:.2f}%")
+
+    print(f"\nIntegrity:")
+    print(f"  Overall SHA-256: {results['overall_sha256']}")
+    print(f"  Merkle root:     {results['merkle_root']}")
+
+    print(f"\nTiming:")
+    print(f"  Elapsed:    {transfer_stats['elapsed_seconds']:.2f}s")
+    print(f"  Throughput: {transfer_stats['throughput_mb_per_sec']:.1f} MB/s")
+    print(f"  Uploaded:   {transfer_stats['uploaded_bytes'] / (1024**2):.1f} MB")
+
+    print("\n" + "=" * 80)
+
+
+if __name__ == "__main__":
+    import sys
+
+    dump_file = "test_dump2.bin"
+
+    if not Path(dump_file).exists():
+        print(f"Error: {dump_file} not found")
+        sys.exit(1)
+
+    run_complete_pipeline(dump_file=dump_file, case_id="CASE-2024-001", use_moto=True)
